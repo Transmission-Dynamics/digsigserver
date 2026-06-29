@@ -265,6 +265,7 @@ def attach_request_context_handlers(app: Sanic):
         request_source_ip.set(None)
         request_ssl_client_s_dn.set(None)
         request_ssl_client_verify.set(None)
+        await utils.dump_upload_and_reset_logs()
 
 
 def attach_exception_handlers(app: Sanic):

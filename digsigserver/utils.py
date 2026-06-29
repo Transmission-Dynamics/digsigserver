@@ -1,10 +1,18 @@
+from datetime import datetime
 import os
+import random
+import re
 import shutil
 import subprocess
 from urllib.parse import urlparse
+import uuid
+from astral import now
 from sanic import request
 from sanic.log import logger
 from typing import Optional
+
+from digsigserver.digsigserver.logredaction import install_log_redaction_filter
+from digsigserver.digsigserver.server import LogAuditCategory, log_audit
 
 
 def extract_files(workdir: str, f: request.File) -> bool:
@@ -96,3 +104,86 @@ def to_boolean(boolstr: Optional[str]) -> bool:
     if not boolstr:
         return False
     return boolstr.upper() in ["Y", "YES", "1", "T", "TRUE", "ON"]
+
+
+def _extract_last_log_item_index(log_content: str) -> Optional[int]:
+    for line in reversed(log_content.splitlines()):
+        match = re.match(r'\s*item:\s*(\d+)\s+--', line)
+        if match:
+            return int(match.group(1))
+    return None
+
+
+def _build_yubihsm_redaction_secrets(password: str) -> list[str]:
+    auth_key = password[0:4]
+    pass_value = password[4:]
+    return [password, auth_key, pass_value]
+
+
+async def dump_upload_and_reset_logs() -> None:
+    password = os.environ.get('DIGSIGSERVER_YUBIHSM_PASSWORD')
+    if not password or len(password) <= 4:
+        logger.warning('Skipping YubiHSM audit log dump: DIGSIGSERVER_YUBIHSM_PASSWORD is not configured correctly')
+        return
+
+    auth_key, pass_value = _build_yubihsm_redaction_secrets(password)[1:]
+    install_log_redaction_filter(_build_yubihsm_redaction_secrets(password))
+
+    timestamp_str = datetime.now().strftime('%Y%m%d_%H%M%S')
+    temp_log_file = f'audit-{timestamp_str}.log'
+    upload_uri = f's3://td-yubihsm-backup/logs/hsm-main/{temp_log_file}'
+    upload_succeeded = False
+
+    try:
+        subprocess.run(
+            ['yubihsm-shell', '-a', 'get-logs', '--out', temp_log_file, '--authkey', auth_key, '-p', pass_value],
+            check=True,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            encoding='utf-8',
+        )
+
+        with open(temp_log_file, 'r', encoding='utf-8') as f:
+            log_content = f.read()
+
+        last_item_index = _extract_last_log_item_index(log_content)
+        if last_item_index is None:
+            logger.warning('Skipping YubiHSM audit log index update: no log items found in %s', temp_log_file)
+            return
+
+        upload_file(temp_log_file, upload_uri)
+        upload_succeeded = True
+
+        set_log_index = last_item_index - 1
+        if upload_succeeded:
+            subprocess.run(
+                ['yubihsm-shell', '-a', 'set-log-index', '--log-index', str(set_log_index), '--authkey', auth_key, '-p', pass_value],
+                check=True,
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                encoding='utf-8',
+            )
+
+        log_audit(
+            LogAuditCategory.AUDIT_LOG_EVENTS,
+            'yubihsm_audit_logs_archived',
+            'success',
+            upload_uri=upload_uri,
+            upload_succeeded=upload_succeeded,
+            log_item_index=last_item_index,
+            set_log_index=set_log_index,
+            log_line_count=len(log_content.splitlines()),
+        )
+    except (OSError, RuntimeError, subprocess.CalledProcessError) as exc:
+        logger.exception('Failed to dump and archive YubiHSM audit logs')
+        log_audit(
+            LogAuditCategory.AUDIT_LOG_EVENTS,
+            'yubihsm_audit_logs_archived',
+            'failure',
+            level=40,
+            exc=exc,
+            upload_uri=upload_uri,
+        )
+    finally:
+        if os.path.exists(temp_log_file):
+            os.remove(temp_log_file)
