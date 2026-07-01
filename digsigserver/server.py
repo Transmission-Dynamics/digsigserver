@@ -49,6 +49,7 @@ request_source_ip: ContextVar[str | None] = ContextVar('request_source_ip', defa
 request_ssl_client_s_dn: ContextVar[str | None] = ContextVar('request_ssl_client_s_dn', default=None)
 request_ssl_client_verify: ContextVar[str | None] = ContextVar('request_ssl_client_verify', default=None)
 TRUSTED_PROXY_IPS = {'172.30.0.11'}
+AUDIT_LOG_DUMP_EXCLUDED_PATHS = {'/health'}
 
 
 def load_dotenv(path: str = '.env') -> None:
@@ -77,6 +78,9 @@ def create_app() -> Sanic:
     app = Sanic(name='digsigserver', env_prefix='DIGSIGSERVER_', log_config=build_sanic_log_config(resolved_level))
     app.config.update_config(CodesignSanicDefaults)
     app.config.load_environment_vars(prefix='DIGSIGSERVER_')
+    file_backed_password = utils.read_secret_file(app.config.get('YUBIHSM_PASSWORD_FILE'))
+    if file_backed_password is not None:
+        app.config['YUBIHSM_PASSWORD'] = file_backed_password
     install_log_redaction_filter([app.config.get('YUBIHSM_PASSWORD')])
     install_request_logging_filter()
     attach_request_context_handlers(app)
@@ -261,11 +265,13 @@ def attach_request_context_handlers(app: Sanic):
     @app.on_response
     async def clear_request_source_ip(req: request, res):
         del res
+        should_dump_audit_logs = req.path not in AUDIT_LOG_DUMP_EXCLUDED_PATHS
         del req
         request_source_ip.set(None)
         request_ssl_client_s_dn.set(None)
         request_ssl_client_verify.set(None)
-        await utils.dump_upload_and_reset_logs()
+        if should_dump_audit_logs:
+            await utils.dump_upload_and_reset_logs()
 
 
 def attach_exception_handlers(app: Sanic):

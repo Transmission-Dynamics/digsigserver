@@ -1,18 +1,14 @@
 from datetime import datetime
 import os
-import random
 import re
 import shutil
 import subprocess
 from urllib.parse import urlparse
-import uuid
-from astral import now
 from sanic import request
 from sanic.log import logger
 from typing import Optional
 
-from digsigserver.digsigserver.logredaction import install_log_redaction_filter
-from digsigserver.digsigserver.server import LogAuditCategory, log_audit
+from digsigserver.logredaction import install_log_redaction_filter
 
 
 def extract_files(workdir: str, f: request.File) -> bool:
@@ -115,15 +111,79 @@ def _extract_last_log_item_index(log_content: str) -> Optional[int]:
 
 
 def _build_yubihsm_redaction_secrets(password: str) -> list[str]:
-    auth_key = password[0:4]
+    auth_key = f"0x{password[0:4]}"
     pass_value = password[4:]
     return [password, auth_key, pass_value]
 
 
+def read_secret_file(path: Optional[str]) -> Optional[str]:
+    if not path:
+        return None
+
+    try:
+        with open(path, 'r', encoding='utf-8') as secret_file:
+            secret_value = secret_file.read().strip()
+    except OSError:
+        logger.warning('Unable to read secret file: %s', path)
+        return None
+
+    return secret_value or None
+
+
+def get_digsigserver_yubihsm_password() -> Optional[str]:
+    password = read_secret_file(os.environ.get('DIGSIGSERVER_YUBIHSM_PASSWORD_FILE'))
+    if password is not None:
+        return password
+    return os.environ.get('DIGSIGSERVER_YUBIHSM_PASSWORD')
+
+
+def get_hsm_audit_log_target() -> str:
+    target = os.environ.get('HSM_AUDIT_LOG_TARGET', 'hsm-main')
+    if target in {'hsm-main', 'hsm-backup'}:
+        return target
+
+    logger.warning('Invalid HSM_AUDIT_LOG_TARGET=%s, defaulting to hsm-main', target)
+    return 'hsm-main'
+
+
+def get_hsm_audit_log_bucket() -> str:
+    bucket = os.environ.get('HSM_AUDIT_LOG_BUCKET', 'td-yubihsm-backup').strip()
+    if bucket:
+        return bucket
+
+    logger.warning('Invalid HSM_AUDIT_LOG_BUCKET=%s, defaulting to td-yubihsm-backup', bucket)
+    return 'td-yubihsm-backup'
+
+
+def get_digsigserver_yubihsm_connector() -> str:
+    connector = os.environ.get('DIGSIGSERVER_YUBIHSM_CONNECTOR', 'http://host.docker.internal:12345').strip()
+    if connector:
+        return connector
+
+    logger.warning(
+        'Invalid DIGSIGSERVER_YUBIHSM_CONNECTOR=%s, defaulting to http://host.docker.internal:12345',
+        connector,
+    )
+    return 'http://host.docker.internal:12345'
+
+
+def build_yubihsm_shell_command(action: str, *args: str) -> list[str]:
+    return [
+        'yubihsm-shell',
+        '--connector',
+        get_digsigserver_yubihsm_connector(),
+        '-a',
+        action,
+        *args,
+    ]
+
+
 async def dump_upload_and_reset_logs() -> None:
-    password = os.environ.get('DIGSIGSERVER_YUBIHSM_PASSWORD')
+    from digsigserver.server import LogAuditCategory, log_audit
+
+    password = get_digsigserver_yubihsm_password()
     if not password or len(password) <= 4:
-        logger.warning('Skipping YubiHSM audit log dump: DIGSIGSERVER_YUBIHSM_PASSWORD is not configured correctly')
+        logger.warning('Skipping YubiHSM audit log dump: YubiHSM password is not configured correctly')
         return
 
     auth_key, pass_value = _build_yubihsm_redaction_secrets(password)[1:]
@@ -131,12 +191,12 @@ async def dump_upload_and_reset_logs() -> None:
 
     timestamp_str = datetime.now().strftime('%Y%m%d_%H%M%S')
     temp_log_file = f'audit-{timestamp_str}.log'
-    upload_uri = f's3://td-yubihsm-backup/logs/hsm-main/{temp_log_file}'
+    upload_uri = f's3://{get_hsm_audit_log_bucket()}/logs/{get_hsm_audit_log_target()}/{temp_log_file}'
     upload_succeeded = False
 
     try:
         subprocess.run(
-            ['yubihsm-shell', '-a', 'get-logs', '--out', temp_log_file, '--authkey', auth_key, '-p', pass_value],
+            build_yubihsm_shell_command('get-logs', '--out', temp_log_file, '--authkey', auth_key, '-p', pass_value),
             check=True,
             stdin=subprocess.DEVNULL,
             capture_output=True,
@@ -157,7 +217,15 @@ async def dump_upload_and_reset_logs() -> None:
         set_log_index = last_item_index - 1
         if upload_succeeded:
             subprocess.run(
-                ['yubihsm-shell', '-a', 'set-log-index', '--log-index', str(set_log_index), '--authkey', auth_key, '-p', pass_value],
+                build_yubihsm_shell_command(
+                    'set-log-index',
+                    '--log-index',
+                    str(set_log_index),
+                    '--authkey',
+                    auth_key,
+                    '-p',
+                    pass_value,
+                ),
                 check=True,
                 stdin=subprocess.DEVNULL,
                 capture_output=True,

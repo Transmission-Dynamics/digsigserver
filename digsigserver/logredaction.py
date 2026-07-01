@@ -1,4 +1,5 @@
 import logging
+import subprocess
 from typing import Any
 
 
@@ -23,9 +24,38 @@ class SecretRedactionFilter(logging.Filter):
             return {key: self._redact(item) for key, item in value.items()}
         return value
 
+    def _redact_exception(self, exc: BaseException) -> BaseException:
+        if isinstance(exc, subprocess.CalledProcessError):
+            return subprocess.CalledProcessError(
+                exc.returncode,
+                self._redact(exc.cmd),
+                output=self._redact(exc.output),
+                stderr=self._redact(exc.stderr),
+            )
+
+        redacted_args = self._redact(exc.args)
+        try:
+            return type(exc)(*redacted_args)
+        except Exception:
+            return RuntimeError(self._redact(str(exc)))
+
+    def _redact_record_fields(self, record: logging.LogRecord) -> None:
+        for key, value in tuple(record.__dict__.items()):
+            if key in {'msg', 'args', 'exc_info', 'exc_text', 'message'}:
+                continue
+            record.__dict__[key] = self._redact(value)
+
     def filter(self, record: logging.LogRecord) -> bool:
         record.msg = self._redact(record.msg)
         record.args = self._redact(record.args)
+        if isinstance(record.msg, str):
+            record.msg = self._redact(record.getMessage())
+            record.args = ()
+        if record.exc_info:
+            exc_type, exc_value, exc_traceback = record.exc_info
+            if exc_value is not None:
+                record.exc_info = (exc_type, self._redact_exception(exc_value), exc_traceback)
+        self._redact_record_fields(record)
         if hasattr(record, 'exc_text'):
             record.exc_text = None
         return True
