@@ -1,3 +1,4 @@
+import hashlib
 import logging
 import subprocess
 from typing import Any
@@ -11,10 +12,14 @@ class SecretRedactionFilter(logging.Filter):
     def set_secrets(self, secrets: list[str]) -> None:
         self._secrets = [secret for secret in secrets if secret]
 
+    @staticmethod
+    def _redaction_token(secret: str) -> str:
+        return f"sha256:{hashlib.sha256(secret.encode('utf-8')).digest()[:16].hex()}"
+
     def _redact(self, value: Any) -> Any:
         if isinstance(value, str):
             for secret in self._secrets:
-                value = value.replace(secret, '<redacted>')
+                value = value.replace(secret, self._redaction_token(secret))
             return value
         if isinstance(value, tuple):
             return tuple(self._redact(item) for item in value)

@@ -81,7 +81,7 @@ def create_app() -> Sanic:
     file_backed_password = utils.read_secret_file(app.config.get('YUBIHSM_PASSWORD_FILE'))
     if file_backed_password is not None:
         app.config['YUBIHSM_PASSWORD'] = file_backed_password
-    install_log_redaction_filter([app.config.get('YUBIHSM_PASSWORD')])
+    install_log_redaction_filter(utils.get_yubihsm_redaction_secrets())
     install_request_logging_filter()
     attach_request_context_handlers(app)
     attach_exception_handlers(app)

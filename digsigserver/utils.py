@@ -111,9 +111,12 @@ def _extract_last_log_item_index(log_content: str) -> Optional[int]:
 
 
 def _build_yubihsm_redaction_secrets(password: str) -> list[str]:
-    auth_key = f"0x{password[0:4]}"
     pass_value = password[4:]
-    return [password, auth_key, pass_value]
+    return [password, pass_value]
+
+
+def _split_yubihsm_password(password: str) -> tuple[str, str]:
+    return f"0x{password[0:4]}", password[4:]
 
 
 def read_secret_file(path: Optional[str]) -> Optional[str]:
@@ -135,6 +138,30 @@ def get_digsigserver_yubihsm_password() -> Optional[str]:
     if password is not None:
         return password
     return os.environ.get('DIGSIGSERVER_YUBIHSM_PASSWORD')
+
+
+def get_digsigserver_yubihsm_password_logs() -> Optional[str]:
+    password = read_secret_file(os.environ.get('DIGSIGSERVER_YUBIHSM_PASSWORD_LOGS_FILE'))
+    if password is not None:
+        return password
+
+    password = os.environ.get('DIGSIGSERVER_YUBIHSM_PASSWORD_LOGS')
+    if password is not None:
+        return password
+
+    return get_digsigserver_yubihsm_password()
+
+
+def get_yubihsm_redaction_secrets() -> list[str]:
+    secrets: list[str] = []
+
+    for password in (get_digsigserver_yubihsm_password(), get_digsigserver_yubihsm_password_logs()):
+        if password and len(password) > 4:
+            for secret in _build_yubihsm_redaction_secrets(password):
+                if secret not in secrets:
+                    secrets.append(secret)
+
+    return secrets
 
 
 def get_hsm_audit_log_target() -> str:
@@ -181,13 +208,12 @@ def build_yubihsm_shell_command(action: str, *args: str) -> list[str]:
 async def dump_upload_and_reset_logs() -> None:
     from digsigserver.server import LogAuditCategory, log_audit
 
-    password = get_digsigserver_yubihsm_password()
+    password = get_digsigserver_yubihsm_password_logs()
     if not password or len(password) <= 4:
         logger.warning('Skipping YubiHSM audit log dump: YubiHSM password is not configured correctly')
         return
 
-    auth_key, pass_value = _build_yubihsm_redaction_secrets(password)[1:]
-    install_log_redaction_filter(_build_yubihsm_redaction_secrets(password))
+    auth_key, pass_value = _split_yubihsm_password(password)
 
     timestamp_str = datetime.now().strftime('%Y%m%d_%H%M%S')
     temp_log_file = f'audit-{timestamp_str}.log'
