@@ -3,12 +3,15 @@ import os
 import re
 import shutil
 import subprocess
+import threading
 from urllib.parse import urlparse
 from sanic import request
 from sanic.log import logger
 from typing import Optional
 
 from digsigserver.logredaction import install_log_redaction_filter
+
+_hsm_audit_log_lock = threading.Lock()
 
 
 def extract_files(workdir: str, f: request.File) -> bool:
@@ -78,7 +81,7 @@ def uri_fetch(uri: str, dest: str, is_dir=False):
     raise RuntimeError('unrecognized URI: {}'.format(uri))
 
 
-def upload_file(filename: str, uri: str):
+def upload_file(filename: str, uri: str, *, timeout: Optional[float] = None):
     u = urlparse(uri)
     if u.scheme == 'file' or u.scheme == '':
         shutil.copyfile(filename, u.path)
@@ -89,7 +92,8 @@ def upload_file(filename: str, uri: str):
         try:
             subprocess.run(cmd,
                            check=True, encoding='utf-8',
-                           stdin=subprocess.DEVNULL, capture_output=True)
+                           stdin=subprocess.DEVNULL, capture_output=True,
+                           timeout=timeout)
         except subprocess.CalledProcessError as e:
             raise RuntimeError('cmd:{}\nstderr: {}'.format(' '.join(cmd), e.stderr))
         return
@@ -205,7 +209,12 @@ def build_yubihsm_shell_command(action: str, *args: str) -> list[str]:
     ]
 
 
-async def dump_upload_and_reset_logs() -> None:
+def dump_upload_and_reset_logs(*, only_if_needed: bool = False) -> None:
+    with _hsm_audit_log_lock:
+        _dump_upload_and_reset_logs(only_if_needed=only_if_needed)
+
+
+def _dump_upload_and_reset_logs(*, only_if_needed: bool) -> None:
     from digsigserver.server import LogAuditCategory, log_audit
 
     password = get_digsigserver_yubihsm_password_logs()
@@ -215,18 +224,38 @@ async def dump_upload_and_reset_logs() -> None:
 
     auth_key, pass_value = _split_yubihsm_password(password)
 
-    timestamp_str = datetime.now().strftime('%Y%m%d_%H%M%S')
+    timestamp_str = datetime.now().strftime('%Y%m%d_%H%M%S_%f')
     temp_log_file = f'audit-{timestamp_str}.log'
     upload_uri = f's3://{get_hsm_audit_log_bucket()}/logs/{get_hsm_audit_log_target()}/{temp_log_file}'
     upload_succeeded = False
 
     try:
+        if only_if_needed:
+            # GET DEVICE INFO needs no login, so idle checks do not create audit entries.
+            info = subprocess.run(
+                build_yubihsm_shell_command('get-device-info'),
+                check=True,
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                encoding='utf-8',
+                timeout=30,
+            )
+            usage = re.search(r'^Log used:\s*(\d+)/(\d+)\s*$', info.stdout, re.MULTILINE)
+            if not usage:
+                raise RuntimeError('Unable to read YubiHSM audit log usage')
+            used, capacity = map(int, usage.groups())
+            if capacity <= 0 or not 0 <= used <= capacity:
+                raise RuntimeError('Invalid YubiHSM audit log usage')
+            if used * 2 < capacity:
+                return
+
         subprocess.run(
             build_yubihsm_shell_command('get-logs', '--out', temp_log_file, '--authkey', auth_key, '-p', pass_value),
             check=True,
             stdin=subprocess.DEVNULL,
             capture_output=True,
             encoding='utf-8',
+            timeout=30,
         )
 
         with open(temp_log_file, 'r', encoding='utf-8') as f:
@@ -237,10 +266,10 @@ async def dump_upload_and_reset_logs() -> None:
             logger.warning('Skipping YubiHSM audit log index update: no log items found in %s', temp_log_file)
             return
 
-        upload_file(temp_log_file, upload_uri)
+        upload_file(temp_log_file, upload_uri, timeout=120)
         upload_succeeded = True
 
-        set_log_index = last_item_index - 1
+        set_log_index = (last_item_index - 1) % 65536
         if upload_succeeded:
             subprocess.run(
                 build_yubihsm_shell_command(
@@ -256,6 +285,7 @@ async def dump_upload_and_reset_logs() -> None:
                 stdin=subprocess.DEVNULL,
                 capture_output=True,
                 encoding='utf-8',
+                timeout=30,
             )
 
         log_audit(
@@ -268,7 +298,7 @@ async def dump_upload_and_reset_logs() -> None:
             set_log_index=set_log_index,
             log_line_count=len(log_content.splitlines()),
         )
-    except (OSError, RuntimeError, subprocess.CalledProcessError) as exc:
+    except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
         logger.exception('Failed to dump and archive YubiHSM audit logs')
         log_audit(
             LogAuditCategory.AUDIT_LOG_EVENTS,
@@ -277,6 +307,7 @@ async def dump_upload_and_reset_logs() -> None:
             level=40,
             exc=exc,
             upload_uri=upload_uri,
+            stderr=getattr(exc, 'stderr', None),
         )
     finally:
         if os.path.exists(temp_log_file):

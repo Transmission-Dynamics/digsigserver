@@ -86,7 +86,15 @@ def create_app() -> Sanic:
     attach_request_context_handlers(app)
     attach_exception_handlers(app)
     attach_endpoints(app)
+    app.add_task(monitor_hsm_audit_logs)
     return app
+
+
+async def monitor_hsm_audit_logs(app: Sanic) -> None:
+    # TLS handshakes consume audit space even when no request reaches the app.
+    while True:
+        await asyncio.to_thread(utils.dump_upload_and_reset_logs, only_if_needed=True)
+        await asyncio.sleep(30)
 
 
 def resolve_log_level(log_level: int | str | None) -> int:
@@ -265,13 +273,11 @@ def attach_request_context_handlers(app: Sanic):
     @app.on_response
     async def clear_request_source_ip(req: request, res):
         del res
-        should_dump_audit_logs = req.path not in AUDIT_LOG_DUMP_EXCLUDED_PATHS
-        del req
         request_source_ip.set(None)
         request_ssl_client_s_dn.set(None)
         request_ssl_client_verify.set(None)
-        if should_dump_audit_logs:
-            await utils.dump_upload_and_reset_logs()
+        if req.path not in AUDIT_LOG_DUMP_EXCLUDED_PATHS:
+            await asyncio.to_thread(utils.dump_upload_and_reset_logs)
 
 
 def attach_exception_handlers(app: Sanic):
